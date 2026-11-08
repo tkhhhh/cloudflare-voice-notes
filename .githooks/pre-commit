@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Blocks commits that contain credentials or sensitive files.
+# Install once: git config core.hooksPath .githooks
+set -u
+
+RED=$'\033[0;31m'; YELLOW=$'\033[0;33m'; RESET=$'\033[0m'
+fail=0
+
+report() {
+  echo "${RED}✖ pre-commit: $1${RESET}" >&2
+  fail=1
+}
+
+# --- 1. Block sensitive filenames outright ---
+# Matches real secret files; allows *.example / *.sample templates.
+blocked_files_regex='(^|/)(\.env(\..+)?|\.dev\.vars|\.npmrc|\.pypirc|id_rsa|id_dsa|id_ecdsa|id_ed25519|.*\.pem|.*\.key|.*\.pfx|.*\.p12|.*\.keystore|credentials(\.json)?|service-account.*\.json|gcp-key.*\.json|aws-credentials.*)$'
+
+while IFS= read -r file; do
+  [ -z "$file" ] && continue
+  # Skip example/sample/template files
+  case "$file" in
+    *.example|*.sample|*.template|*.example.*|*.sample.*) continue ;;
+  esac
+  if echo "$file" | grep -qE "$blocked_files_regex"; then
+    report "refusing to commit sensitive file: $file"
+  fi
+done < <(git diff --cached --name-only --diff-filter=AM)
+
+# --- 2. Scan staged content for credential patterns ---
+# Each line: "label|regex"
+patterns=(
+  'AWS Access Key|AKIA[0-9A-Z]{16}'
+  'AWS Secret Access Key|aws_secret_access_key["\x27 ]*[:=][^A-Za-z0-9/+=]*[A-Za-z0-9/+=]{40}'
+  'GCP API Key|AIza[0-9A-Za-z_-]{35}'
+  'GCP Service Account|"private_key":[[:space:]]*"-----BEGIN'
+  'OpenAI API Key|sk-(proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}'
+  'Anthropic API Key|sk-ant-(api|admin)[0-9]{2}-[A-Za-z0-9_-]{20,}'
+  'GitHub Token|gh[pousr]_[A-Za-z0-9]{36,}'
+  'GitHub Fine-Grained PAT|github_pat_[A-Za-z0-9_]{20,}'
+  'Slack Token|xox[baprs]-[A-Za-z0-9-]{10,}'
+  'Stripe Live Key|(sk|rk)_live_[A-Za-z0-9]{20,}'
+  'Cloudflare API Token|[A-Za-z0-9_-]{40}[[:space:]]*#.*cloudflare'
+  'Private Key Block|-----BEGIN ((RSA|EC|DSA|OPENSSH|PGP) )?PRIVATE KEY-----'
+  'JWT|eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'
+  'Generic Password Assignment|(password|passwd|pwd)[[:space:]]*[:=][[:space:]]*["\x27][^"\x27$<{]{6,}["\x27]'
+  'Generic Secret Assignment|(secret|api[_-]?key|access[_-]?token|auth[_-]?token)[[:space:]]*[:=][[:space:]]*["\x27][A-Za-z0-9_+/=-]{16,}["\x27]'
+)
+
+# Diff only added lines (lines starting with +, excluding the +++ file header).
+staged_added=$(git diff --cached --unified=0 --no-color --diff-filter=AM | grep -E '^\+' | grep -vE '^\+\+\+')
+
+if [ -n "$staged_added" ]; then
+  for entry in "${patterns[@]}"; do
+    label="${entry%%|*}"
+    regex="${entry#*|}"
+    matches=$(echo "$staged_added" | grep -E -i "$regex" || true)
+    if [ -n "$matches" ]; then
+      report "possible $label detected in staged changes:"
+      echo "$matches" | head -3 | sed 's/^/    /' >&2
+    fi
+  done
+fi
+
+# --- 3. High-entropy string heuristic (opt-in via SCAN_ENTROPY=1) ---
+# Catches random-looking strings that don't match known formats.
+if [ "${SCAN_ENTROPY:-0}" = "1" ] && [ -n "$staged_added" ]; then
+  suspicious=$(echo "$staged_added" | grep -oE '[A-Za-z0-9+/=_-]{32,}' | awk 'length($0) >= 32 && /[A-Z]/ && /[a-z]/ && /[0-9]/' | head -5)
+  if [ -n "$suspicious" ]; then
+    echo "${YELLOW}⚠  pre-commit: high-entropy strings found (verify these aren't secrets):${RESET}" >&2
+    echo "$suspicious" | sed 's/^/    /' >&2
+  fi
+fi
+
+if [ "$fail" -ne 0 ]; then
+  echo "" >&2
+  echo "${RED}Commit blocked.${RESET} If this is a false positive, bypass with:" >&2
+  echo "    git commit --no-verify" >&2
+  exit 1
+fi
+
+exit 0

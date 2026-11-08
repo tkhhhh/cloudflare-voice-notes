@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Voice Notes</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Voice Notes</h1>
+      <p class="sub">Record a thought. Whisper transcribes it, Llama 3.3 categorizes it.</p>
+    </header>
+
+    <section class="recorder">
+      <button id="recordBtn" class="record" type="button">
+        <span class="dot"></span>
+        <span id="recordLabel">Record</span>
+      </button>
+      <div id="status" class="status" aria-live="polite"></div>
+    </section>
+
+    <section class="filters">
+      <button class="filter active" data-filter="all">All</button>
+      <button class="filter" data-filter="todo">todo</button>
+      <button class="filter" data-filter="reminder">reminder</button>
+      <button class="filter" data-filter="idea">idea</button>
+      <button class="filter" data-filter="question">question</button>
+      <button class="filter" data-filter="note">note</button>
+    </section>
+
+    <section class="messages">
+      <ul id="messageList"></ul>
+      <p id="empty" class="empty" hidden>No messages yet. Hit record above.</p>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
