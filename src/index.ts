@@ -1,7 +1,12 @@
 export interface Env {
   AI: Ai;
   ASSETS: Fetcher;
+  MESSAGES: KVNamespace;
 }
+
+const KEY_PREFIX = "messages:";
+const SEED_MARKER = "init:seeded:v1";
+const msgKey = (id: string) => `${KEY_PREFIX}${id}`;
 
 type Status = "processing" | "done" | "error";
 
@@ -29,24 +34,25 @@ Definitions:
 
 Respond with ONLY the single lowercase word. No punctuation, no explanation.`;
 
-const messages = new Map<string, Message>();
-seedFakeData(messages);
+let seedPromise: Promise<void> | null = null;
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
 
+    await ensureSeeded(env.MESSAGES);
+
     try {
       if (path === "/api/record" && req.method === "POST") {
         return await handleRecord(req, env, ctx);
       }
       if (path === "/api/messages" && req.method === "GET") {
-        return handleList();
+        return await handleList(env);
       }
       const match = path.match(/^\/api\/messages\/([a-f0-9-]+)$/);
       if (match && req.method === "DELETE") {
-        messages.delete(match[1]);
+        await env.MESSAGES.delete(msgKey(match[1]));
         return Response.json({ ok: true });
       }
     } catch (err) {
@@ -68,21 +74,28 @@ async function handleRecord(req: Request, env: Env, ctx: ExecutionContext): Prom
   }
 
   const id = crypto.randomUUID();
-  messages.set(id, {
+  const placeholder: Message = {
     id,
     transcript: null,
     category: null,
     status: "processing",
     created_at: Date.now(),
-  });
+  };
+  await env.MESSAGES.put(msgKey(id), JSON.stringify(placeholder));
 
   ctx.waitUntil(processAudio(id, audio, env));
 
   return Response.json({ messageId: id });
 }
 
-function handleList(): Response {
-  const sorted = Array.from(messages.values()).sort((a, b) => b.created_at - a.created_at);
+async function handleList(env: Env): Promise<Response> {
+  const { keys } = await env.MESSAGES.list({ prefix: KEY_PREFIX });
+  const values = await Promise.all(
+    keys.map((k) => env.MESSAGES.get<Message>(k.name, "json")),
+  );
+  const sorted = values
+    .filter((m): m is Message => m !== null)
+    .sort((a, b) => b.created_at - a.created_at);
   return Response.json({ messages: sorted });
 }
 
@@ -98,7 +111,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 }
 
 async function processAudio(id: string, audio: ArrayBuffer, env: Env): Promise<void> {
-  const entry = messages.get(id);
+  const entry = await env.MESSAGES.get<Message>(msgKey(id), "json");
   if (!entry) return;
 
   try {
@@ -130,14 +143,27 @@ async function processAudio(id: string, audio: ArrayBuffer, env: Env): Promise<v
       ? (normalized as Category)
       : "note";
 
-    messages.set(id, { ...entry, transcript, category, status: "done" });
+    const done: Message = { ...entry, transcript, category, status: "done" };
+    await env.MESSAGES.put(msgKey(id), JSON.stringify(done));
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : "unknown error";
-    messages.set(id, { ...entry, status: "error", error: errorMessage });
+    const failed: Message = { ...entry, status: "error", error: errorMessage };
+    await env.MESSAGES.put(msgKey(id), JSON.stringify(failed));
   }
 }
 
-function seedFakeData(store: Map<string, Message>): void {
+function ensureSeeded(kv: KVNamespace): Promise<void> {
+  seedPromise ??= (async () => {
+    const marker = await kv.get(SEED_MARKER);
+    if (marker) return;
+    const seed = buildSeedData();
+    await Promise.all(seed.map((m) => kv.put(msgKey(m.id), JSON.stringify(m))));
+    await kv.put(SEED_MARKER, "1");
+  })();
+  return seedPromise;
+}
+
+function buildSeedData(): Message[] {
   const now = Date.now();
   const minute = 60_000;
   const hour = 60 * minute;
@@ -202,13 +228,11 @@ function seedFakeData(store: Map<string, Message>): void {
     },
   ];
 
-  for (const m of seed) {
-    store.set(m.id, {
-      id: m.id,
-      transcript: m.transcript,
-      category: m.category,
-      status: m.status ?? "done",
-      created_at: m.created_at,
-    });
-  }
+  return seed.map((m) => ({
+    id: m.id,
+    transcript: m.transcript,
+    category: m.category,
+    status: m.status ?? "done",
+    created_at: m.created_at,
+  }));
 }

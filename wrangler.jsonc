@@ -1,6 +1,6 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "voice-notes",
+	"name": "cloudflare-voice-notes",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-11-01",
 	"compatibility_flags": [
@@ -14,6 +14,12 @@
 	"ai": {
 		"binding": "AI"
 	},
+	"kv_namespaces": [
+		{
+			"binding": "MESSAGES",
+			"id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+		}
+	],
 	"observability": {
 		"enabled": true
 	}
