@@ -86,25 +86,44 @@ function handleList(): Response {
   return Response.json({ messages: sorted });
 }
 
+const WHISPER_TIMEOUT_MS = 25_000;
+const LLAMA_TIMEOUT_MS = 10_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 async function processAudio(id: string, audio: ArrayBuffer, env: Env): Promise<void> {
   const entry = messages.get(id);
   if (!entry) return;
 
   try {
-    const whisper = await env.AI.run("@cf/openai/whisper", {
-      audio: [...new Uint8Array(audio)],
-    });
+    const whisper = await withTimeout(
+      env.AI.run("@cf/openai/whisper", {
+        audio: [...new Uint8Array(audio)],
+      }),
+      WHISPER_TIMEOUT_MS,
+      "whisper",
+    );
     const transcript = (whisper as { text?: string }).text?.trim();
     if (!transcript) throw new Error("empty transcript from Whisper");
 
-    const classify = await env.AI.run("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: transcript },
-      ],
-      temperature: 0,
-      max_tokens: 8,
-    });
+    const classify = await withTimeout(
+      env.AI.run("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: transcript },
+        ],
+        temperature: 0,
+        max_tokens: 8,
+      }),
+      LLAMA_TIMEOUT_MS,
+      "llama",
+    );
     const raw = (classify as { response?: string }).response ?? "";
     const normalized = raw.trim().toLowerCase().replace(/[^a-z]/g, "");
     const category: Category = (CATEGORIES as readonly string[]).includes(normalized)
