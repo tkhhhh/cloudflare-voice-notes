@@ -53,7 +53,7 @@ if [ -n "$staged_added" ]; then
   for entry in "${patterns[@]}"; do
     label="${entry%%|*}"
     regex="${entry#*|}"
-    matches=$(echo "$staged_added" | grep -E -i "$regex" || true)
+    matches=$(echo "$staged_added" | grep -E -i -e "$regex" || true)
     if [ -n "$matches" ]; then
       report "possible $label detected in staged changes:"
       echo "$matches" | head -3 | sed 's/^/    /' >&2
