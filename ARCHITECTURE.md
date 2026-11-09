@@ -1,12 +1,12 @@
 # How this app works
 
-A single Cloudflare Worker that serves a static web page, records audio from the browser, transcribes it with Whisper, classifies it with Llama, and files the result into an in-memory inbox.
+A single Cloudflare Worker that serves a static web page, records audio from the browser, transcribes it with Whisper, classifies it with Llama, and files the result into a Workers KV–backed inbox.
 
 Three files do all the real work:
 
 - `public/index.html` + `public/app.js` — the UI (served as static assets by the Worker)
-- `src/index.ts` — the Worker: HTTP routes + AI pipeline + in-memory store
-- `wrangler.jsonc` — binds Workers AI (`AI`) and the static assets folder (`ASSETS`)
+- `src/index.ts` — the Worker: HTTP routes + AI pipeline + KV-backed store
+- `wrangler.jsonc` — binds Workers AI (`AI`), the KV namespace (`MESSAGES`), and the static assets folder (`ASSETS`)
 
 ---
 
@@ -17,15 +17,15 @@ Three files do all the real work:
 │ Browser  │                    │          Worker               │
 │          │                    │                               │
 │ Record   │ ──POST /api/record──▶ handleRecord()                │
-│ (webm)   │ ◀──{ messageId }──  │   1. put placeholder in Map  │
+│ (webm)   │ ◀──{ messageId }──  │   1. put placeholder in KV   │
 │          │                    │   2. ctx.waitUntil(pipeline)  │
 │          │                    │   3. return messageId NOW     │
 │          │                    │                               │
 │ Poll     │ ──GET /api/messages─▶ handleList()                  │
-│ every    │ ◀──messages[]────── │   returns Map as array       │
+│ every    │ ◀──messages[]────── │   list+get from KV           │
 │ 1.5s     │                    │                               │
 │          │                    │   (background, asynchronously)│
-│          │                    │   Whisper → Llama → update Map│
+│          │                    │   Whisper → Llama → put in KV │
 └──────────┘                    └───────────────────────────────┘
 ```
 
@@ -62,14 +62,17 @@ This is a lightweight workflow pattern — you don't need Durable Objects or Wor
 ## 3. Worker (`src/index.ts`)
 
 ### State
+Messages live in Workers KV under the `messages:` prefix, one key per message:
+
 ```ts
-const messages = new Map<string, Message>();
-seedFakeData(messages);
+const KEY_PREFIX = "messages:";
+const msgKey = (id: string) => `${KEY_PREFIX}${id}`;
+await env.MESSAGES.put(msgKey(id), JSON.stringify(entry));
 ```
 
-A plain `Map` at module scope. Seeded with 8 fake messages on cold-start so the UI isn't empty on first load.
+On first boot the namespace is seeded with 8 example rows. Seeding is gated by a `init:seeded:v1` marker key so it only runs once per namespace, and a module-scope `seedPromise` dedupes concurrent requests inside the same isolate. Bumping the marker suffix (`v2`, `v3`, …) is how you re-seed after changing the fixtures.
 
-**Caveat (intentional, demo scope):** this state lives inside one isolate. Two users on different isolates see different data, and a cold start wipes everything. Real apps would swap this for D1 or a Durable Object.
+**Trade-off:** KV is eventually consistent. A write is readable on the same edge location very quickly, but a `GET` right after a `PUT` from a different region may briefly see the stale value. For this polling UI it's invisible — the next tick picks it up — but it's worth knowing before reaching for KV in a strongly-consistent flow.
 
 ### Routing
 The `fetch` handler is a tiny manual router:
@@ -77,18 +80,19 @@ The `fetch` handler is a tiny manual router:
 | Method + path | Handler |
 | --- | --- |
 | `POST /api/record` | `handleRecord` — accept audio, enqueue pipeline |
-| `GET /api/messages` | `handleList` — return all messages, newest first |
-| `DELETE /api/messages/:id` | inline — `messages.delete(id)` |
+| `GET /api/messages` | `handleList` — list KV keys, fetch values, sort newest first |
+| `DELETE /api/messages/:id` | inline — `env.MESSAGES.delete(msgKey(id))` |
 | anything else | `env.ASSETS.fetch(req)` — serves `public/` |
 
-The fallback to `ASSETS` is what lets `/`, `/index.html`, `/app.js`, `/styles.css` all work without any explicit route. The static assets binding in `wrangler.jsonc` handles them.
+`ensureSeeded(env.MESSAGES)` runs before any route so a cold namespace fills itself on the first request. The fallback to `ASSETS` is what lets `/`, `/index.html`, `/app.js`, `/styles.css` all work without any explicit route.
 
 ### `handleRecord`
 ```ts
 const audio = await req.arrayBuffer();
 // size guards: reject empty, reject > 20 MB
 const id = crypto.randomUUID();
-messages.set(id, { id, transcript: null, category: null, status: "processing", created_at: Date.now() });
+const placeholder: Message = { id, transcript: null, category: null, status: "processing", created_at: Date.now() };
+await env.MESSAGES.put(msgKey(id), JSON.stringify(placeholder));
 ctx.waitUntil(processAudio(id, audio, env));
 return Response.json({ messageId: id });
 ```
@@ -96,38 +100,55 @@ return Response.json({ messageId: id });
 Three things to notice:
 1. The placeholder is written **before** the background job starts, so a `GET /api/messages` immediately after the upload will already show the processing row.
 2. `ctx.waitUntil(...)` is fire-and-forget from the client's perspective but **tracked** by the Worker runtime — the isolate stays alive until the promise resolves.
-3. The response returns in milliseconds; the client never waits for Whisper or Llama.
+3. The response returns as soon as the placeholder write completes; the client never waits for Whisper or Llama.
 
 ### `processAudio` — the actual AI pipeline
 
+Both AI calls are wrapped in `withTimeout(promise, ms, label)` — a `Promise.race` against a `setTimeout` that rejects with a labeled error. Without this, a slow or hung model call could keep the isolate alive until the platform's own limit kicks in; with it, the row flips to `error` with a clear reason.
+
+```ts
+const WHISPER_TIMEOUT_MS = 25_000;
+const LLAMA_TIMEOUT_MS   = 10_000;
+```
+
 Step A — **Whisper transcription**:
 ```ts
-const whisper = await env.AI.run("@cf/openai/whisper", {
-  audio: [...new Uint8Array(audio)],  // model expects a number array
-});
-const transcript = whisper.text?.trim();
+const whisper = await withTimeout(
+  env.AI.run("@cf/openai/whisper", {
+    audio: [...new Uint8Array(audio)],  // model expects a number array
+  }),
+  WHISPER_TIMEOUT_MS,
+  "whisper",
+);
+const transcript = (whisper as { text?: string }).text?.trim();
+if (!transcript) throw new Error("empty transcript from Whisper");
 ```
 
 Step B — **Llama classification**:
 ```ts
-const classify = await env.AI.run("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
-  messages: [
-    { role: "system", content: SYSTEM_PROMPT },
-    { role: "user",   content: transcript },
-  ],
-  temperature: 0,  // deterministic
-  max_tokens: 8,   // we only want one word
-});
+const classify = await withTimeout(
+  env.AI.run("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user",   content: transcript },
+    ],
+    temperature: 0,  // deterministic
+    max_tokens: 8,   // we only want one word
+  }),
+  LLAMA_TIMEOUT_MS,
+  "llama",
+);
 ```
 
 The system prompt constrains output to one of five lowercase words (`todo`, `idea`, `reminder`, `note`, `question`). The response is then normalized (lowercase, strip non-letters) and validated against the allowed set. If the model hallucinates anything else, it falls back to `"note"`. This "closed-set" approach is the trick that makes LLM classification reliable without JSON mode or function calling.
 
 Step C — **Commit result**:
 ```ts
-messages.set(id, { ...entry, transcript, category, status: "done" });
+const done: Message = { ...entry, transcript, category, status: "done" };
+await env.MESSAGES.put(msgKey(id), JSON.stringify(done));
 ```
 
-On any error, status becomes `"error"` with the message attached. The browser will show either the finished row or (if we added UI for it) the error.
+On any error (including timeouts), status becomes `"error"` with the message attached and is written back to KV. The browser will show either the finished row or (if we added UI for it) the error.
 
 ### Why two models?
 
@@ -139,23 +160,25 @@ Whisper is specialized for audio → text; Llama is specialized for text → lab
 
 ```jsonc
 {
-  "name": "voice-notes",
+  "name": "cloudflare-voice-notes",
   "main": "src/index.ts",
   "compatibility_date": "2026-11-01",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
-  "assets":  { "directory": "./public", "binding": "ASSETS" },
-  "ai":      { "binding": "AI" },
-  "observability": { "enabled": true }
+  "assets":         { "directory": "./public", "binding": "ASSETS" },
+  "ai":             { "binding": "AI" },
+  "kv_namespaces":  [{ "binding": "MESSAGES", "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }],
+  "observability":  { "enabled": true }
 }
 ```
 
 - `assets` — Cloudflare serves `public/` directly from the edge; `env.ASSETS.fetch(req)` is the programmatic fallback the Worker uses for non-API routes.
 - `ai` — enables `env.AI.run(model, input)` to hit Workers AI without any API keys in code.
-- `workers_dev: true` — publishes to `voice-notes.<account>.workers.dev`; no custom domain needed.
+- `kv_namespaces.MESSAGES` — the inbox store. Create one with `wrangler kv namespace create MESSAGES` and paste the returned id into `wrangler.jsonc` (and a `preview_id` if you want local `wrangler dev` isolation).
+- `workers_dev: true` — publishes to `cloudflare-voice-notes.<account>.workers.dev`; no custom domain needed.
 - `observability` — surfaces logs/metrics in the dashboard.
 
-No secrets, no D1, no R2, no KV. The whole thing runs on two bindings.
+No secrets, no D1, no R2. The whole thing runs on three bindings.
 
 ---
 
@@ -163,10 +186,11 @@ No secrets, no D1, no R2, no KV. The whole thing runs on two bindings.
 
 | Missing piece | Why it's OK for the demo |
 | --- | --- |
-| Durable storage | Single-user demo; `Map` + seed data makes the UI feel alive |
+| Per-user partitioning | Single-user demo; every request reads the same KV prefix |
 | Auth | Single-user demo |
 | Audio file storage (R2) | Classification happens inline; no need to keep the raw audio |
-| Retry / dead-letter | If a Workers AI call fails, the row is marked `error` and that's visible to the user |
+| Retry / dead-letter | If a Workers AI call fails or times out, the row is marked `error` and that's visible to the user |
 | Streaming partial transcripts | Nice-to-have — would need WebSockets or SSE |
+| Strong consistency on reads | KV is eventually consistent; fine for 1.5s polling but wrong for request/response flows |
 
-If you were productionizing this, the first change would be: swap the `Map` for D1, keyed by user, and move `processAudio` into a Workflow or Durable Object so retries survive isolate restarts.
+If you were productionizing this, the first change would be: namespace keys by user (`messages:<user>:<id>`) and move `processAudio` into a Workflow or Durable Object so retries survive isolate restarts. If you need strong read-your-writes guarantees, swap KV for D1 or a Durable Object.

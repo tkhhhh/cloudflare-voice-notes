@@ -44,3 +44,9 @@ This file captures the prompts sent to Claude Code (Opus 4.7) while building the
 
 ### Prompt 11
 > Can you use the existing KV for persistent data store and replace the usage of in-memory data store, the KV_ID is set as secret in the worker pipeline and the app will read it from the env during deploying stage
+
+### Prompt 12
+> can you update the architecutre doc
+
+### Prompt 13
+> append these 2 promot into the prompt doc

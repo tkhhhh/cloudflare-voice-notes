@@ -18,11 +18,11 @@ Record a short voice message in the browser. The app transcribes it with Whisper
  │  Browser   │ ────audio/webm─────▶   │        Worker          │
  │ MediaRec.  │ ◀───messageId──────    │  src/index.ts          │
  │            │                        │                        │
- │   polls    │ ── GET /api/messages ─▶│  Map<id, Message>      │
+ │   polls    │ ── GET /api/messages ─▶│  KV<id, Message>      │
  │            │                        │                        │
  │            │                        │  ctx.waitUntil(        │
  │            │                        │    Whisper → Llama →   │
- │            │                        │    update Map)         │
+ │            │                        │    update KV)         │
  └────────────┘                        └────────────────────────┘
 ```
 
@@ -35,15 +35,6 @@ Fixed set, chosen for coverage without overlap:
 - **idea** — concept to explore
 - **question** — something to look up
 - **note** — fallback for general observations
-
-## State caveat
-
-The `Map` lives in the Worker's module scope. In production this means:
-
-- State is lost on isolate restart / cold start.
-- Different requests may hit different isolates and see different state.
-
-Fine for the demo. For a real app, swap the `Map` for D1 or Durable Objects.
 
 ## Local dev
 
@@ -64,17 +55,20 @@ npm run deploy
 
 ```
 cloudflare-voice-notes/
-├── wrangler.jsonc        # AI + Assets bindings only
+├── wrangler.jsonc        # AI + Assets + KV bindings
 ├── src/
-│   └── index.ts          # Worker: HTTP routes + inline AI pipeline + in-memory Map
+│   └── index.ts          # Worker: HTTP routes + inline AI pipeline, backed by KV
 ├── public/
 │   ├── index.html
 │   ├── app.js            # MediaRecorder + polling
 │   └── styles.css
+├── scripts/
+│   └── deploy.mjs        # Substitutes $KV_ID into wrangler.jsonc, then `wrangler deploy`
+├── ARCHITECTURE.md       # Design notes
 └── prompts.md            # AI prompt history for submission
 ```
 
 ## Submission notes
 
 - `prompts.md` contains the full prompt history used while building this with Claude Code (Opus 4.7).
-- Single-user demo — no auth, no persistent storage.
+- Single-user demo — no auth.
